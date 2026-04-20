@@ -34,30 +34,24 @@ def calculate_custom_settle_date(base_dt, row, full_text):
     k1 = str(row.get('키워드1(카드사명)', '')).strip()
     k2 = str(row.get('키워드2(유형)', '')).strip()
     
-    # 기본 입금 일수 추출 (숫자만)
     days_str = str(row['입금 요일(주말 및 공휴일 제외)'])
     days_to_add = int(re.search(r'\d+', days_str).group()) if re.search(r'\d+', days_str) else 3
     
-    weekday = base_dt.weekday() # 0:월, 1:화, 2:수, 3:목, 4:금, 5:토, 6:일
+    weekday = base_dt.weekday() 
 
-    # 1. 삼성카드 특별 로직
     if "삼성" in m_name or "삼성" in k1:
-        if weekday == 4: # 금요일
+        if weekday == 4: 
             days_to_add = 2
-        elif weekday == 3: # 목요일
-            # 내일(금요일)이 공휴일인지 확인
+        elif weekday == 3: 
             tomorrow = base_dt + timedelta(days=1)
             if tomorrow in kr_holidays:
                 days_to_add = 2
-
-    # 2. 하나카드(신용) 특별 로직 (키워드2가 체크가 아닐 때)
     elif ("하나" in m_name or "하나" in k1) and "체크" not in k2:
-        if weekday in [2, 3]: # 수(2), 목(3)요일
+        if weekday in [2, 3]: 
             days_to_add = 2
-        else: # 금(4), 월(0), 화(1)요일 등
+        else: 
             days_to_add = 3
 
-    # 영업일 계산 (주말/공휴일 제외)
     current_date = base_dt
     added_days = 0
     while added_days < days_to_add:
@@ -66,9 +60,9 @@ def calculate_custom_settle_date(base_dt, row, full_text):
             added_days += 1
     return current_date
 
-# --- 메인 UI 로직 시작 ---
+# --- 메인 UI ---
 st.set_page_config(page_title="동명베어링 카드 정산기", layout="wide")
-st.title("📸 카드 매출 자동 정산기 (특수 날짜 로직 포함)")
+st.title("📸 카드 매출 자동 정산기")
 
 uploaded_file = st.camera_input("영수증을 촬영하세요")
 
@@ -78,16 +72,23 @@ if uploaded_file:
     if full_text:
         st.subheader("🔍 분석 결과")
         
-        # 금액 추출
-        amount_match = re.search(r'(?:합계|금액|판매금액|Total)\s*[:]*\s*([\d,]+)', full_text, re.IGNORECASE)
-        amount = int(amount_match.group(1).replace(',', '')) if amount_match else 0
+        # 1. 금액 추출 로직 (수정됨: '합계'를 최우선으로 찾음)
+        # '합계', '합 계', 'Total'을 먼저 찾고, 없으면 '판매금액', '금액'을 찾습니다.
+        amount = 0
+        # 순서가 중요합니다: 합계 계열 키워드를 먼저 배치
+        priority_keywords = [r'합\s*계', r'Total', r'승인금액', r'판매금액', r'금액']
         
-        # 날짜 추출
+        for keyword in priority_keywords:
+            match = re.search(f'{keyword}\s*[:]*\s*([\d,]+)', full_text, re.IGNORECASE)
+            if match:
+                amount = int(match.group(1).replace(',', ''))
+                break # 합계를 찾으면 바로 멈춤 (판매금액까지 안 내려감)
+
+        # 2. 날짜 추출
         date_match = re.search(r'(\d{2,4}[-/.]\d{2}[-/.]\d{2})', full_text)
         if date_match:
             raw_date = date_match.group(1).replace('.','-').replace('/','-')
             try:
-                # 26-04-17 같은 2자리 연도 대응
                 if len(raw_date.split('-')[0]) == 2:
                     base_dt = datetime.strptime("20" + raw_date, "%Y-%m-%d")
                 else:
@@ -98,7 +99,7 @@ if uploaded_file:
             base_dt = datetime.now()
 
         try:
-            # 엑셀 로드
+            # 엑셀 로드 (파일명 확인 필요: rules.xlsx)
             try: rules = pd.read_excel("rules.xlsx")
             except: rules = pd.read_csv("rules.xlsx")
 
@@ -118,25 +119,24 @@ if uploaded_file:
                         break
             
             if final_match is not None:
-                # 수수료율 추출 및 계산
                 fee_text = str(final_match['카드수수료'])
                 fee_rate_match = re.search(r"(\d+\.\d+)", fee_text)
                 
                 if fee_rate_match:
                     fee_rate = float(fee_rate_match.group(1))
-                    fee_amount = math.floor(amount * fee_rate)
-                    settle_amount = math.ceil(amount - (amount * fee_rate))
                     
-                    # 특수 날짜 로직 적용하여 입금일 계산
+                    # 요청하신 계산 방식 적용
+                    fee_amount = math.floor(amount * fee_rate) # 수수료: 원단위 절사(내림)
+                    settle_amount = math.ceil(amount - (amount * fee_rate)) # 수금금액: 무조건 올림
+                    
                     settle_date = calculate_custom_settle_date(base_dt, final_match, full_text)
 
-                    # 화면 출력
                     c1, c2, c3 = st.columns(3)
                     with c1:
                         st.info(f"🏦 **매입/카드사**\n\n{final_match['매입사명']} / {k1_val}")
                         st.write(f"거래일: {base_dt.strftime('%Y-%m-%d (%a)')}")
                     with c2:
-                        st.success(f"💰 **합계 금액**\n\n{amount:,}원")
+                        st.success(f"💰 **최종 합계 금액**\n\n{amount:,}원")
                         st.write(f"수수료율: {fee_rate*100:.2f}%")
                     with c3:
                         st.warning(f"📩 **수금 예정액**\n\n{settle_amount:,}원")
