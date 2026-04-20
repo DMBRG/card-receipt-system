@@ -1,5 +1,6 @@
-streamlit
-pandas
-openpyxl
+Pillow
 holidays
+pandas
 requests
+streamlit
+openpyxl
