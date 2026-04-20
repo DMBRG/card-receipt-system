@@ -5,8 +5,9 @@ import time
 import json
 import re
 import pandas as pd
+import math
 from datetime import datetime, timedelta
-import holidays # 공휴일 계산을 위해 필요 (requirements.txt에 추가 확인)
+import holidays
 
 # --- 네이버 OCR 함수 ---
 def get_naver_ocr_text(image_bytes):
@@ -26,21 +27,48 @@ def get_naver_ocr_text(image_bytes):
         return " ".join([f['inferText'] for f in res.json()['images'][0]['fields']])
     return None
 
-# --- 영업일 계산 함수 (주말/공휴일 제외) ---
-def calculate_settle_date(base_date, days_to_add):
+# --- 영업일 및 특수 입금일 계산 함수 ---
+def calculate_custom_settle_date(base_dt, row, full_text):
     kr_holidays = holidays.KR()
-    current_date = base_date
+    m_name = str(row['매입사명'])
+    k1 = str(row.get('키워드1(카드사명)', '')).strip()
+    k2 = str(row.get('키워드2(유형)', '')).strip()
+    
+    # 기본 입금 일수 추출 (숫자만)
+    days_str = str(row['입금 요일(주말 및 공휴일 제외)'])
+    days_to_add = int(re.search(r'\d+', days_str).group()) if re.search(r'\d+', days_str) else 3
+    
+    weekday = base_dt.weekday() # 0:월, 1:화, 2:수, 3:목, 4:금, 5:토, 6:일
+
+    # 1. 삼성카드 특별 로직
+    if "삼성" in m_name or "삼성" in k1:
+        if weekday == 4: # 금요일
+            days_to_add = 2
+        elif weekday == 3: # 목요일
+            # 내일(금요일)이 공휴일인지 확인
+            tomorrow = base_dt + timedelta(days=1)
+            if tomorrow in kr_holidays:
+                days_to_add = 2
+
+    # 2. 하나카드(신용) 특별 로직 (키워드2가 체크가 아닐 때)
+    elif ("하나" in m_name or "하나" in k1) and "체크" not in k2:
+        if weekday in [2, 3]: # 수(2), 목(3)요일
+            days_to_add = 2
+        else: # 금(4), 월(0), 화(1)요일 등
+            days_to_add = 3
+
+    # 영업일 계산 (주말/공휴일 제외)
+    current_date = base_dt
     added_days = 0
     while added_days < days_to_add:
         current_date += timedelta(days=1)
-        # 토요일(5), 일요일(6) 및 공휴일 제외
         if current_date.weekday() < 5 and current_date not in kr_holidays:
             added_days += 1
     return current_date
 
-# --- UI 세팅 ---
+# --- 메인 UI 로직 시작 ---
 st.set_page_config(page_title="동명베어링 카드 정산기", layout="wide")
-st.title("📸 카드 매출 자동 정산기")
+st.title("📸 카드 매출 자동 정산기 (특수 날짜 로직 포함)")
 
 uploaded_file = st.camera_input("영수증을 촬영하세요")
 
@@ -48,65 +76,78 @@ if uploaded_file:
     full_text = get_naver_ocr_text(uploaded_file.getvalue())
     
     if full_text:
-        st.subheader("🔍 영수증 분석 결과")
+        st.subheader("🔍 분석 결과")
         
-        # 1. 금액 추출 (합계/판매금액 등 키워드 기반)
+        # 금액 추출
         amount_match = re.search(r'(?:합계|금액|판매금액|Total)\s*[:]*\s*([\d,]+)', full_text, re.IGNORECASE)
         amount = int(amount_match.group(1).replace(',', '')) if amount_match else 0
         
-        # 2. 거래일시 추출
+        # 날짜 추출
         date_match = re.search(r'(\d{2,4}[-/.]\d{2}[-/.]\d{2})', full_text)
-        tran_date_str = date_match.group(1) if date_match else datetime.now().strftime("%Y-%m-%d")
-        
-        # 3. 엑셀 규칙 매칭
+        if date_match:
+            raw_date = date_match.group(1).replace('.','-').replace('/','-')
+            try:
+                # 26-04-17 같은 2자리 연도 대응
+                if len(raw_date.split('-')[0]) == 2:
+                    base_dt = datetime.strptime("20" + raw_date, "%Y-%m-%d")
+                else:
+                    base_dt = datetime.strptime(raw_date, "%Y-%m-%d")
+            except:
+                base_dt = datetime.now()
+        else:
+            base_dt = datetime.now()
+
         try:
-            # CSV 혹은 Excel 로드 (파일명 확인 필요)
-            rules = pd.read_csv("rules.xlsx") if "csv" in "rules.xlsx" else pd.read_excel("rules.xlsx")
+            # 엑셀 로드
+            try: rules = pd.read_excel("rules.xlsx")
+            except: rules = pd.read_csv("rules.xlsx")
+
             final_match = None
-            
             for _, row in rules.iterrows():
                 m_name = str(row['매입사명']).strip()
-                k1 = str(row.get('키워드1(카드사명)', '')).strip() if pd.notna(row.get('키워드1(카드사명)', '')) else ""
-                k2 = str(row.get('키워드2(유형)', '')).strip() if pd.notna(row.get('키워드2(유형)', '')) else ""
+                k1_val = str(row.get('키워드1(카드사명)', '')).strip() if pd.notna(row.get('키워드1(카드사명)', '')) else ""
+                k2_val = str(row.get('키워드2(유형)', '')).strip() if pd.notna(row.get('키워드2(유형)', '')) else ""
 
                 if m_name in full_text:
-                    # 키워드1과 키워드2가 영수증에 모두 있는지 확인 (빈칸이면 무시)
-                    k1_match = (k1 == "" or k1 in full_text)
-                    k2_match = (k2 == "" or k2 in full_text)
+                    k1_list = [item.strip() for item in k1_val.split(',')] if k1_val else [""]
+                    k1_match = any(item in full_text for item in k1_list) if k1_val else True
+                    k2_match = (k2_val == "" or k2_val in full_text)
                     
                     if k1_match and k2_match:
                         final_match = row
                         break
             
             if final_match is not None:
-                # 계산 로직
-                fee_rate = float(final_match['카드수수료'])
-                fee_amount = int(amount * fee_rate)
-                settle_amount = amount - fee_amount
+                # 수수료율 추출 및 계산
+                fee_text = str(final_match['카드수수료'])
+                fee_rate_match = re.search(r"(\d+\.\d+)", fee_text)
                 
-                # 입금일 계산
-                days_to_add = int(final_match['입금 요일(주말 및 공휴일 제외)'])
-                try:
-                    base_dt = datetime.strptime(tran_date_str.replace('.','-').replace('/','-'), "%Y-%m-%d")
-                except:
-                    base_dt = datetime.now()
-                settle_date = calculate_settle_date(base_dt, days_to_add)
+                if fee_rate_match:
+                    fee_rate = float(fee_rate_match.group(1))
+                    fee_amount = math.floor(amount * fee_rate)
+                    settle_amount = math.ceil(amount - (amount * fee_rate))
+                    
+                    # 특수 날짜 로직 적용하여 입금일 계산
+                    settle_date = calculate_custom_settle_date(base_dt, final_match, full_text)
 
-                # 화면 출력
-                c1, c2, c3 = st.columns(3)
-                with c1:
-                    st.metric("추출 매입사", final_match['매입사명'])
-                    st.write(f"💳 카드사: {final_match.get('키워드1(카드사명)', '기타')}")
-                with c2:
-                    st.metric("판매 합계", f"{amount:,}원")
-                    st.write(f"📉 수수료: {fee_rate*100:.1f}% (-{fee_amount:,}원)")
-                with c3:
-                    st.metric("수금 예정금액", f"{settle_amount:,}원")
-                    st.write(f"📅 입금 예정일: {settle_date.strftime('%Y-%m-%d (%a)')}")
-                
+                    # 화면 출력
+                    c1, c2, c3 = st.columns(3)
+                    with c1:
+                        st.info(f"🏦 **매입/카드사**\n\n{final_match['매입사명']} / {k1_val}")
+                        st.write(f"거래일: {base_dt.strftime('%Y-%m-%d (%a)')}")
+                    with c2:
+                        st.success(f"💰 **합계 금액**\n\n{amount:,}원")
+                        st.write(f"수수료율: {fee_rate*100:.2f}%")
+                    with c3:
+                        st.warning(f"📩 **수금 예정액**\n\n{settle_amount:,}원")
+                        st.write(f"수수료: -{fee_amount:,}원 (절사)")
+
+                    st.divider()
+                    st.write(f"📅 **입금 예정일:** {settle_date.strftime('%Y년 %m월 %d일 (%a)')} 입금 예정")
+                else:
+                    st.error("수수료 요율을 찾을 수 없습니다.")
             else:
-                st.warning("⚠️ 일치하는 카드사 규칙을 찾을 수 없습니다.")
-                st.text(f"인식된 텍스트 일부: {full_text[:200]}...")
+                st.warning("일치하는 카드사 규칙을 찾을 수 없습니다.")
                 
         except Exception as e:
-            st.error(f"데이터 처리 오류: {e}")
+            st.error(f"데이터 처리 중 오류 발생: {e}")
